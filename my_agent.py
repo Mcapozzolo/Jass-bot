@@ -1,5 +1,4 @@
 import numpy as np
-
 from jass.game.const import *
 from jass.game.rule_schieber import RuleSchieber
 from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list
@@ -84,10 +83,40 @@ class MyAgent(Agent):
         return best_trump
 
     def action_play_card(self, obs) -> int:
+
+      
+
+        return self.play_worst_card(obs)
+    
+
+    def play_worst_card(self, obs) -> int:
         """
-        Wählt eine Karte, die gespielt wird.
-        Aktuell: zufällig aus allen gültigen Karten.
+        Wählt die schlechteste Karte, die gespielt wird (für Debugging-Zwecke).
         """
         valid_cards = self._rule.get_valid_cards_from_obs(obs)
         valid_indices = np.flatnonzero(valid_cards)
-        return int(np.random.choice(valid_indices))
+
+        worst_card = None
+        worst_trumpcard = None
+        worst_score = -1
+        worst_trumpscore = -1
+
+
+        non_trumps = []
+        for card in valid_indices:
+            if color_of_card[card] != obs.trump:
+                non_trumps.append(card)
+
+        if len(non_trumps) > 0:
+            for card in non_trumps:
+                r = offset_of_card[card]
+                if r > worst_score:
+                    worst_score = r
+                    worst_card = int(card)
+        else:
+            for card in valid_indices:
+                r = offset_of_card[card]
+                if r > worst_score:
+                    worst_score = r
+                    worst_card = int(card)
+        return worst_card
