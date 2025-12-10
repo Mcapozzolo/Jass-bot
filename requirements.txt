@@ -1,3 +1,5 @@
 jass_kit
 flask
 numpy
+scikit-learn
+joblib
