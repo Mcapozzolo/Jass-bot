@@ -5,6 +5,14 @@ import joblib
 from jass.game.const import *
 from jass.game.rule_schieber import RuleSchieber
 from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list
+from jass.game.game_sim import GameSim
+from jass.game.game_state_util import state_from_observation
+from jass.agents.agent import Agent
+
+
+from jass.game.const import *
+from jass.game.rule_schieber import RuleSchieber
+from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list
 from jass.agents.agent import Agent
 
 # ---------------------------------------------------------
@@ -61,7 +69,7 @@ def card_strength(card: int, trump: int) -> int:
         return NO_TRUMP_SCORE[rank]
 
 
-class MyAgent(Agent):
+class MyAgentcomplex(Agent):
     """
     Mein Jass-Agent:
     - Trumpfwahl mit ML-Modell (Multi-Layer-Perceptron aus scikit-learn)
@@ -78,6 +86,13 @@ class MyAgent(Agent):
     def __init__(self):
         super().__init__()
         self._rule = RuleSchieber()
+        
+        # RNG für MCTS
+        self._rng = np.random.default_rng()
+
+        # MCTS-Parameter
+        self._mcts_iterations = 200
+        self._mcts_exploration_c = 1.4
 
         # Trumpf-ML-Modell laden
         model_path = os.path.join(os.path.dirname(__file__), 'Data', 'trump_model_sw.joblib')
@@ -87,6 +102,7 @@ class MyAgent(Agent):
         except Exception as e:
             print(f"[MyAgent] Konnte Trumpfmodell nicht laden ({model_path}): {e}")
             self._trump_model = None
+    
 
     # ---------------------------------------------------------
     # Trumpfwahl
@@ -143,64 +159,76 @@ class MyAgent(Agent):
     # ---------------------------------------------------------
     def action_play_card(self, obs) -> int:
         """
-        Wählt eine gültige Karte aus obs.hand.
+        Wählt eine gültige Karte mit Monte Carlo Tree Search (Root-MCTS + Determinization).
 
-        Idee:
-        - Wenn noch viele Karten ( > 5 ) auf der Hand sind:
-            * schwächste Karte spielen, bevorzugt keine Trumpfkarte
-        - Wenn nur noch wenige Karten ( <= 5 ):
-            * stärkste Karte spielen
+        - Knoten = aktueller Zustand (obs)
+        - Kanten = mögliche Karten
+        - UCB1 steuert Exploration vs. Exploitation
         """
         valid_mask = self._rule.get_valid_cards_from_obs(obs)
-        valid_indices = np.flatnonzero(valid_mask)
+        valid_cards = np.flatnonzero(valid_mask)
 
-        # Sicherheitscheck (sollte nie passieren)
-        if len(valid_indices) == 0:
-            return 0
+        # Trivialfall: nur eine gültige Karte
+        if valid_cards.size == 1:
+            return int(valid_cards[0])
 
-        trump = obs.trump
-        cards_left = int(np.sum(obs.hand))
+        my_player = obs.player
+        my_team = 0 if my_player in (0, 2) else 1
 
-        # Frühe Phase: viele Karten → schlechte Karte loswerden
-        if cards_left > 5:
-            non_trump_cards = []
+        # Statistik pro Karte (global über alle Determinizations)
+        N = np.zeros(36, dtype=np.int32)    # Besuchszahlen
+        W = np.zeros(36, dtype=np.float32)  # Summe der Rewards
 
-            # Nur relevant, wenn ein Farb-Trumpf aktiv ist
-            if trump in [CLUBS, SPADES, HEARTS, DIAMONDS]:
-                for card in valid_indices:
-                    if color_of_card[card] != trump:
-                        non_trump_cards.append(card)
+        C = self._mcts_exploration_c
+        iterations = self._mcts_iterations
 
-            # Wenn es non-trump-Karten gibt, nehmen wir diese als Kandidaten,
-            # sonst müssen wir aus allen gültigen Karten wählen.
-            if len(non_trump_cards) > 0:
-                candidates = non_trump_cards
-            else:
-                candidates = list(valid_indices)
+        for it in range(iterations):
+            # ---- 1) Determinization: versteckte Hände sampeln ----
+            hands = self._sample_hidden_hands(obs)
 
-            worst_card = candidates[0]
-            worst_value = card_strength(worst_card, trump)
+            # ---- 2) State aus Observation + Händen erzeugen ----
+            state = state_from_observation(obs, hands)
 
-            for card in candidates[1:]:
-                value = card_strength(card, trump)
-                if value < worst_value:
-                    worst_value = value
-                    worst_card = card
+            # ---- 3) Selection: wähle Karte mit UCB1 ----
+            total_visits = 1 + N[valid_cards].sum()
 
-            return int(worst_card)
+            best_ucb = -1e18
+            best_card = int(valid_cards[0])
 
-        # Späte Phase: wenige Karten → starke Karte spielen
-        else:
-            best_card = valid_indices[0]
-            best_value = card_strength(best_card, trump)
+            for card in valid_cards:
+                n = N[card]
+                if n == 0:
+                    ucb = 1e9  # Erzwinge mind. 1 Besuch
+                else:
+                    exploit = W[card] / n
+                    explore = C * np.sqrt(np.log(total_visits) / n)
+                    ucb = exploit + explore
 
-            for card in valid_indices[1:]:
-                value = card_strength(card, trump)
-                if value > best_value:
-                    best_value = value
-                    best_card = card
+                if ucb > best_ucb:
+                    best_ucb = ucb
+                    best_card = int(card)
 
-            return int(best_card)
+            # ---- 4) Expansion + Simulation: spiele best_card & rollout ----
+            # Wir kopieren den State in einen GameSim und führen best_card aus
+            sim = GameSim(rule=self._rule)
+            sim.init_from_state(state)
+
+            sim.action_play_card(best_card)
+
+            # Rest zufällig spielen
+            reward = self._simulate_random_game(sim.state, my_team)
+
+            # ---- 5) Backpropagation: Statistik updaten ----
+            N[best_card] += 1
+            W[best_card] += reward
+
+        # ---- 6) Aktion wählen: Karte mit den meisten Besuchen ----
+        visits_valid = N[valid_cards]
+        best_idx = int(np.argmax(visits_valid))
+        best_card_final = int(valid_cards[best_idx])
+
+        return best_card_final
+
         
     def _sample_hidden_hands(self, obs) -> np.ndarray:
         """
@@ -270,3 +298,28 @@ class MyAgent(Agent):
 
         return hands
 
+    def _simulate_random_game(self, state, my_team: int) -> float:
+        """
+        Rollout: spiele von diesem State aus zufällig zu Ende und
+        gib (Punkte_mein_Team - Punkte_anderes_Team) zurück.
+        """
+        sim = GameSim(rule=self._rule)
+        sim.init_from_state(state)
+
+        while not sim.is_done():
+            current_player = sim.state.player
+            valid = self._rule.get_valid_cards_from_state(sim.state)
+            valid_indices = np.flatnonzero(valid)
+            if valid_indices.size == 0:
+                break
+            card = int(self._rng.choice(valid_indices))
+            sim.action_play_card(card)
+
+        # Punkte auslesen
+        points0 = int(sim.state.points[0])
+        points1 = int(sim.state.points[1])
+
+        if my_team == 0:
+            return float(points0 - points1)
+        else:
+            return float(points1 - points0)
